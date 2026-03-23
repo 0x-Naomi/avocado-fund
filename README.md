@@ -1,10 +1,7 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/0x-Naomi/avocado-fund/main/contracts/src/AvocadoVault.sol" width="0" height="0" />
-  <h1 align="center">🥑 Avocado Fund</h1>
-</p>
+<h1 align="center">🥑 Avocado Fund</h1>
 
 <p align="center">
-  <strong>Decentralised USDC Lending Protocol on Base</strong>
+  <strong>Decentralised USDC Lending Protocol on Arbitrum</strong>
 </p>
 
 <p align="center">
@@ -18,7 +15,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Solidity-^0.8.28-363636?logo=solidity" alt="Solidity" />
   <img src="https://img.shields.io/badge/Framework-Foundry-orange?logo=ethereum" alt="Foundry" />
-  <img src="https://img.shields.io/badge/Chain-Base-0052FF?logo=coinbase" alt="Base" />
+  <img src="https://img.shields.io/badge/Chain-Arbitrum-28A0F0?logo=arbitrum" alt="Arbitrum" />
   <img src="https://img.shields.io/badge/OpenZeppelin-v5.x-4E5EE4?logo=openzeppelin" alt="OpenZeppelin" />
   <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License" />
 </p>
@@ -169,8 +166,8 @@ contracts/src/
 
 | Network | Chain ID | Status |
 |:--------|:---------|:-------|
-| Base | 8453 | 🟢 Production |
-| Base Sepolia | 84532 | 🟢 Testnet |
+| Arbitrum One | 42161 | 🟢 Production |
+| Arbitrum Sepolia | 421614 | 🟢 Testnet |
 
 ---
 
