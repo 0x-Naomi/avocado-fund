@@ -107,10 +107,13 @@ contract AvocadoLending is IAvocadoLending, Ownable2Step, ReentrancyGuard, Pausa
         Borrower storage b = _borrowers[msg.sender];
         if (b.isDefaulted) revert BorrowerNotApproved(msg.sender);
 
-        // Check credit headroom
-        uint256 currentDebt = _currentPrincipal(msg.sender);
+        // Check credit headroom — include accrued interest so total exposure
+        // (principal + interest + new borrow) never exceeds the credit limit.
+        uint256 currentPrincipal = _currentPrincipal(msg.sender);
+        uint256 accruedInterest = _pendingBorrowerInterest(msg.sender);
+        uint256 currentDebt = currentPrincipal + accruedInterest;
         if (currentDebt + amount > b.creditLimit) {
-            revert ExceedsCreditLimit(amount, b.creditLimit - currentDebt);
+            revert ExceedsCreditLimit(amount, b.creditLimit > currentDebt ? b.creditLimit - currentDebt : 0);
         }
 
         // Check vault has enough idle liquidity
@@ -206,39 +209,46 @@ contract AvocadoLending is IAvocadoLending, Ownable2Step, ReentrancyGuard, Pausa
         b.principal = 0;
         totalPrincipal = totalPrincipal > principal ? totalPrincipal - principal : 0;
 
-        // Mark all loans as repaid
+        // Mark all loans repaid
         LoanTerms[] storage loans = _loans[msg.sender];
         for (uint256 i = 0; i < loans.length; i++) {
-            loans[i].repaid = true;
+            if (!loans[i].repaid) {
+                loans[i].repaid = true;
+            }
         }
 
-        // Pull USDC
+        pendingInterest += interestOwed;
+
+        // Pull full debt from borrower
         usdc.safeTransferFrom(msg.sender, address(this), totalOwed);
 
-        // Report interest
+        // Report interest to vault
         if (interestOwed > 0) {
             _reportInterestToVault(interestOwed);
         }
 
-        emit LoanRepaid(msg.sender, type(uint256).max, principal, interestOwed);
+        emit RepaidAll(msg.sender, principal, interestOwed);
     }
 
-    // ─── Admin ────────────────────────────────────────────────────────────────
+    // ─── Admin functions ──────────────────────────────────────────────────────
 
     /// @inheritdoc IAvocadoLending
-    function approveBorrower(address borrower, uint256 creditLimit) external onlyOwner {
+    function approveBorrower(address borrower, uint256 creditLimit, uint256 worldIdNullifier)
+        external
+        onlyOwner
+    {
         if (borrower == address(0)) revert ZeroAddress();
-        if (_borrowers[borrower].isApproved) revert AlreadyApproved(borrower);
+        if (creditLimit == 0) revert ZeroAmount();
 
-        _borrowers[borrower] = Borrower({
-            creditLimit: creditLimit,
-            principal: 0,
-            interestIndex: 0,
-            lastInterestTime: uint64(block.timestamp),
-            isApproved: true,
-            isDefaulted: false
-        });
-        borrowerList.push(borrower);
+        Borrower storage b = _borrowers[borrower];
+        if (!b.isApproved) {
+            borrowerList.push(borrower);
+        }
+
+        b.isApproved = true;
+        b.creditLimit = creditLimit;
+        b.worldIdNullifier = worldIdNullifier;
+        b.lastInterestTime = uint64(block.timestamp);
 
         emit BorrowerApproved(borrower, creditLimit);
     }
@@ -250,59 +260,53 @@ contract AvocadoLending is IAvocadoLending, Ownable2Step, ReentrancyGuard, Pausa
     }
 
     /// @inheritdoc IAvocadoLending
-    function setCreditLimit(address borrower, uint256 newLimit) external onlyOwner {
-        if (!_borrowers[borrower].isApproved) revert BorrowerNotApproved(borrower);
-        emit CreditLimitUpdated(borrower, _borrowers[borrower].creditLimit, newLimit);
-        _borrowers[borrower].creditLimit = newLimit;
+    function markDefault(address borrower) external onlyOwner {
+        Borrower storage b = _borrowers[borrower];
+        if (b.principal == 0) revert ZeroAmount();
+
+        uint256 interestOwed = _pendingBorrowerInterest(borrower);
+        uint256 totalLost = b.principal + interestOwed;
+
+        b.isDefaulted = true;
+        b.isApproved = false;
+        totalPrincipal = totalPrincipal > b.principal ? totalPrincipal - b.principal : 0;
+        b.principal = 0;
+
+        emit BorrowerDefaulted(borrower, totalLost);
     }
 
     /// @inheritdoc IAvocadoLending
     function setBorrowRate(uint256 newRateBps) external onlyOwner {
         if (newRateBps > MAX_BORROW_RATE_BPS) revert InvalidRate(newRateBps);
-        emit InterestRateUpdated(borrowRateBps, newRateBps);
+        uint256 old = borrowRateBps;
         borrowRateBps = newRateBps;
+        emit BorrowRateUpdated(old, newRateBps);
     }
 
     /// @inheritdoc IAvocadoLending
-    function declareDefault(address borrower) external onlyOwner {
-        Borrower storage b = _borrowers[borrower];
-        uint256 outstanding = b.principal;
-        b.isDefaulted = true;
-        b.isApproved = false;
-
-        // Write down deployed assets in vault
-        if (outstanding > 0) {
-            totalPrincipal = totalPrincipal > outstanding ? totalPrincipal - outstanding : 0;
-            // S-03 fix: Write down vault's deployedAssets to prevent phantom share price inflation
-            try AvocadoVault(vault).writeDownBadDebt(outstanding) {} catch {}
-        }
-
-        emit BorrowerDefaulted(borrower, outstanding);
+    function receiveFromVault(uint256 amount) external {
+        if (msg.sender != vault) revert Unauthorized(msg.sender);
+        totalDeployed += amount;
+        // USDC already transferred by vault via safeTransfer before calling this
+        emit FundsReceived(amount);
     }
 
     /// @inheritdoc IAvocadoLending
-    function returnFundsToVault(uint256 amount) external onlyOwner {
-        if (amount == 0) revert ZeroAmount();
-        uint256 balance = usdc.balanceOf(address(this));
-        if (amount > balance) amount = balance;
-
-        // Approve vault to pull funds (vault calls recallFromLending)
-        usdc.approve(vault, amount);
-        emit InterestAccrued(pendingInterest);
+    function returnToVault(uint256 amount) external onlyOwner {
+        if (amount > usdc.balanceOf(address(this))) revert InsufficientVaultLiquidity(usdc.balanceOf(address(this)), amount);
+        totalDeployed = totalDeployed > amount ? totalDeployed - amount : 0;
+        usdc.safeTransfer(vault, amount);
+        emit FundsReturned(amount);
     }
 
-    /// @inheritdoc IAvocadoLending
-    function accrueAllInterest() external returns (uint256 totalInterest) {
-        address[] memory list = borrowerList;
-        for (uint256 i = 0; i < list.length; i++) {
-            Borrower storage b = _borrowers[list[i]];
-            if (b.isApproved && b.principal > 0) {
-                totalInterest += _accrueInterest(list[i]);
-            }
-        }
-        if (totalInterest > 0) {
-            emit InterestAccrued(totalInterest);
-        }
+    /// @notice Pause the contract (emergency stop)
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Unpause the contract
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     // ─── View functions ───────────────────────────────────────────────────────
@@ -318,76 +322,52 @@ contract AvocadoLending is IAvocadoLending, Ownable2Step, ReentrancyGuard, Pausa
     }
 
     /// @inheritdoc IAvocadoLending
-    function totalOutstandingDebt() external view returns (uint256) {
-        return totalPrincipal + _estimateTotalAccruedInterest();
+    function getLoanCount(address borrower) external view returns (uint256) {
+        return _loans[borrower].length;
     }
 
     /// @inheritdoc IAvocadoLending
-    function borrowerDebt(address borrower) external view returns (uint256 principal, uint256 interest) {
-        Borrower memory b = _borrowers[borrower];
-        principal = b.principal;
+    function getTotalDebt(address borrower) external view returns (uint256 principal, uint256 interest) {
+        principal = _borrowers[borrower].principal;
         interest = _pendingBorrowerInterest(borrower);
     }
 
-    /// @notice List of all borrower addresses
-    function getBorrowerList() external view returns (address[] memory) {
-        return borrowerList;
-    }
-
-    /// @notice Get all loans for a borrower
-    function getBorrowerLoans(address borrower) external view returns (LoanTerms[] memory) {
-        return _loans[borrower];
-    }
-
-    // ─── Internal ─────────────────────────────────────────────────────────────
-
-    /// @notice Accrues simple interest for a specific borrower and updates state
-    /// @return interest Amount of interest accrued
-    function _accrueInterest(address borrower) internal returns (uint256 interest) {
+    /// @inheritdoc IAvocadoLending
+    function getAvailableCredit(address borrower) external view returns (uint256) {
         Borrower storage b = _borrowers[borrower];
-        if (b.principal == 0) return 0;
-
-        uint256 elapsed = block.timestamp - b.lastInterestTime;
-        if (elapsed == 0) return 0;
-
-        // Simple interest: I = P * r * t / (SECONDS_PER_YEAR * BPS_DENOMINATOR)
-        interest = (b.principal * borrowRateBps * elapsed) / (SECONDS_PER_YEAR * BPS_DENOMINATOR);
-        b.lastInterestTime = uint64(block.timestamp);
-
-        // Note: interest is not added to principal (simple, not compound)
+        if (!b.isApproved || b.isDefaulted) return 0;
+        uint256 currentDebt = _currentPrincipal(borrower) + _pendingBorrowerInterest(borrower);
+        return b.creditLimit > currentDebt ? b.creditLimit - currentDebt : 0;
     }
 
-    /// @notice View-only estimate of pending interest for a borrower
-    function _pendingBorrowerInterest(address borrower) internal view returns (uint256) {
-        Borrower memory b = _borrowers[borrower];
-        if (b.principal == 0) return 0;
-        uint256 elapsed = block.timestamp - b.lastInterestTime;
-        return (b.principal * borrowRateBps * elapsed) / (SECONDS_PER_YEAR * BPS_DENOMINATOR);
-    }
+    // ─── Internal functions ───────────────────────────────────────────────────
 
-    /// @notice Estimate total accrued interest across all borrowers (view)
-    function _estimateTotalAccruedInterest() internal view returns (uint256 total) {
-        address[] memory list = borrowerList;
-        for (uint256 i = 0; i < list.length; i++) {
-            total += _pendingBorrowerInterest(list[i]);
-        }
-    }
-
-    /// @notice Get current principal for a borrower
+    /// @notice Returns the current principal for a borrower
     function _currentPrincipal(address borrower) internal view returns (uint256) {
         return _borrowers[borrower].principal;
     }
 
-    /// @notice Report earned interest to the vault to update share price
-    function _reportInterestToVault(uint256 amount) internal {
-        try AvocadoVault(vault).reportInterest(amount) {
-            // Success: vault's deployedAssets increased, share price goes up
-        } catch {
-            // Vault is paused or unavailable — interest stays in lending contract
-        }
+    /// @notice Calculate pending interest for a borrower (not yet accrued)
+    function _pendingBorrowerInterest(address borrower) internal view returns (uint256) {
+        Borrower storage b = _borrowers[borrower];
+        if (b.principal == 0 || b.lastInterestTime == 0) return 0;
+
+        uint256 elapsed = block.timestamp - b.lastInterestTime;
+        // Simple interest: principal * rate * time / (SECONDS_PER_YEAR * BPS_DENOMINATOR)
+        return (b.principal * borrowRateBps * elapsed) / (SECONDS_PER_YEAR * BPS_DENOMINATOR);
     }
 
-    function pause() external onlyOwner { _pause(); }
-    function unpause() external onlyOwner { _unpause(); }
-}
+    /// @notice Accrue interest for a borrower and update state
+    /// @return interestAccrued The amount of interest accrued
+    function _accrueInterest(address borrower) internal returns (uint256 interestAccrued) {
+        interestAccrued = _pendingBorrowerInterest(borrower);
+        _borrowers[borrower].lastInterestTime = uint64(block.timestamp);
+        // Note: accrued interest is tracked separately; added to pendingInterest on repayment
+    }
 
+    /// @notice Report interest to the vault to increase share price
+    function _reportInterestToVault(uint256 interestAmount) internal {
+        pendingInterest = pendingInterest > interestAmount ? pendingInterest - interestAmount : 0;
+        AvocadoVault(vault).reportInterest(interestAmount);
+    }
+}
