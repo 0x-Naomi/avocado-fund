@@ -1,0 +1,34 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+optimizer = true
+optimizer_runs = 999999
+via_ir = true
+solc = "0.8.28"
+
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/",
+]
+
+[profile.default.fuzz]
+runs = 2000
+
+[profile.ci]
+fuzz = { runs = 10000 }
+
+[rpc_endpoints]
+mainnet = "${MAINNET_RPC_URL}"
+arbitrum = "${ARBITRUM_RPC_URL}"
+arbitrum_sepolia = "${ARBITRUM_SEPOLIA_RPC_URL}"
+# Legacy Base endpoints (testnet only)
+base = "${BASE_RPC_URL}"
+base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
+
+[etherscan]
+arbitrum = { key = "${ARBISCAN_API_KEY}", url = "https://api.arbiscan.io/api" }
+arbitrum_sepolia = { key = "${ARBISCAN_API_KEY}", url = "https://api-sepolia.arbiscan.io/api" }
+# Legacy Base endpoints (testnet only)
+base = { key = "${BASESCAN_API_KEY}", url = "https://api.basescan.org/api" }
+base_sepolia = { key = "${BASESCAN_API_KEY}", url = "https://api-sepolia.basescan.org/api" }
